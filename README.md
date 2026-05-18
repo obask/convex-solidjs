@@ -182,6 +182,14 @@ Runs a Convex query through `ConvexHttpClient.query(...)`.
 
 Returns a live accessor for a Convex query.
 
+`args` is `MaybeAccessor<FunctionArgs<Query> | 'skip'>`. Pass `'skip'` (or an accessor that returns `'skip'`) to keep the consumer mounted without subscribing — the accessor resolves synchronously to `undefined` without entering `<Loading>`. Switching from a skip args object to a real args object subscribes; switching back tears the subscription down.
+
+```tsx
+const messages = createQuery(api.messages.list, () =>
+  channel() ? { channel: channel()! } : 'skip',
+)
+```
+
 Options:
 
 - `initialValue`: seed SSR or hydration with prefetched data.
@@ -189,11 +197,33 @@ Options:
 
 ### `createMutation(mutation)`
 
-Returns `(args) => Promise<result>` for Convex mutations.
+Returns a `ConvexMutation`, a callable `(args) => Promise<result>` with two extras:
+
+- `.withOptimisticUpdate(update)` — returns a new bound mutation that wires `update` through Convex's `MutationOptions.optimisticUpdate`. The handler patches the local query cache via `OptimisticLocalStore` and is rolled back automatically when the server transaction completes. This composes across queries and is not replaceable by Solid's `createOptimistic` (which is local-state only).
+- `.pending` — `Accessor<boolean>`, `true` while one or more calls are in flight.
+
+```tsx
+const setCompleted = createMutation(api.todos.setCompleted).withOptimisticUpdate(
+  (store, { id, completed }) => {
+    const list = store.getQuery(api.todos.list, {})
+    if (!list) return
+    store.setQuery(api.todos.list, {}, list.map(t => t._id === id ? { ...t, completed } : t))
+  },
+)
+```
 
 ### `createConvexAction(action)`
 
-Returns `(args) => Promise<result>` for Convex action endpoints.
+Returns a `ConvexAction`, a callable `(args) => Promise<result>` plus a `.pending: Accessor<boolean>` for in-flight tracking. No optimistic updates (Convex actions are not transactional).
+
+### `createConnectionState()`
+
+Returns an `Accessor<ConnectionState>` seeded synchronously from `client.connectionState()` and updated on every change. Useful for offline indicators and dev-only diagnostics.
+
+```tsx
+const conn = createConnectionState()
+return <span>{conn().isWebSocketConnected ? 'online' : 'offline'}</span>
+```
 
 ### `useConvexClient()`
 

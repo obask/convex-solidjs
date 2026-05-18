@@ -3,6 +3,7 @@ import { render } from '@solidjs/web'
 import { describe, expect, it, vi } from 'vite-plus/test'
 import {
   ConvexProvider,
+  createConnectionState,
   createConvexAction,
   createMutation,
   createQuery,
@@ -49,6 +50,31 @@ function createMockClient<T>() {
     }),
     mutation: vi.fn(async (_: unknown, args: unknown) => args),
     action: vi.fn(async (_: unknown, args: unknown) => args),
+    connectionStateValue: {
+      hasInflightRequests: false,
+      isWebSocketConnected: true,
+      timeOfOldestInflightRequest: null,
+      hasEverConnected: true,
+      connectionCount: 1,
+      connectionRetries: 0,
+      inflightMutations: 0,
+      inflightActions: 0,
+    } as any,
+    connectionStateListeners: [] as Array<(s: any) => void>,
+    connectionState: vi.fn(function (this: any) {
+      return this.connectionStateValue
+    }),
+    subscribeToConnectionState: vi.fn(function (this: any, cb: (s: any) => void) {
+      this.connectionStateListeners.push(cb)
+      return () => {
+        const i = this.connectionStateListeners.indexOf(cb)
+        if (i >= 0) this.connectionStateListeners.splice(i, 1)
+      }
+    }),
+    emitConnectionState(next: any) {
+      this.connectionStateValue = next
+      for (const cb of [...this.connectionStateListeners]) cb(next)
+    },
     setCurrent(args: unknown, value: T) {
       currentValues.set(keyFor(args), value)
     },
@@ -250,5 +276,153 @@ describe('client API', () => {
     await expect(act({ prompt: 'hi' } as never)).resolves.toEqual({ prompt: 'hi' })
     expect(client.mutation).toHaveBeenCalledWith(mockMutation, { text: 'hi' })
     expect(client.action).toHaveBeenCalledWith(mockAction, { prompt: 'hi' })
+  })
+
+  it('resolves "skip" args synchronously to undefined without subscribing', async () => {
+    const root = document.createElement('div')
+    const client = createMockClient<string[]>()
+    const [skip, setSkip] = createSignal(true)
+
+    render(
+      () => (
+        <ConvexProvider client={client}>
+          <Loading fallback={<p data-loading>loading</p>}>
+            {(() => {
+              const q = createQuery(mockQuery, () =>
+                skip() ? ('skip' as const) : { channel: 'general' },
+              )
+              return <p data-value>{q() === undefined ? 'undefined' : (q() as string[]).join(',')}</p>
+            })()}
+          </Loading>
+        </ConvexProvider>
+      ),
+      root,
+    )
+
+    expect(root.querySelector('[data-value]')?.textContent).toBe('undefined')
+    expect(root.querySelector('[data-loading]')).toBeNull()
+    expect(client.onUpdate).not.toHaveBeenCalled()
+
+    setSkip(false)
+    flush()
+    await Promise.resolve()
+
+    expect(client.onUpdate).toHaveBeenCalledTimes(1)
+
+    client.emit({ channel: 'general' }, ['hello'])
+    await settle()
+    expect(root.querySelector('[data-value]')?.textContent).toBe('hello')
+
+    setSkip(true)
+    flush()
+    await settle()
+    expect(root.querySelector('[data-value]')?.textContent).toBe('undefined')
+  })
+
+  it('forwards optimisticUpdate via .withOptimisticUpdate and tracks pending', async () => {
+    const root = document.createElement('div')
+    const client = createMockClient<string[]>()
+    let mutate!: ReturnType<typeof createMutation>
+    let pending!: () => boolean
+    const update = vi.fn()
+
+    let release!: (value: unknown) => void
+    client.mutation = vi.fn(
+      () => new Promise(resolve => { release = resolve }),
+    ) as any
+
+    render(
+      () => (
+        <ConvexProvider client={client}>
+          {(() => {
+            const base = createMutation(mockMutation)
+            mutate = base.withOptimisticUpdate(update as any)
+            pending = mutate.pending
+            return null
+          })()}
+        </ConvexProvider>
+      ),
+      root,
+    )
+
+    expect(pending()).toBe(false)
+
+    const inflight = mutate({ text: 'hi' } as never)
+    flush()
+    expect(pending()).toBe(true)
+    expect(client.mutation).toHaveBeenCalledWith(
+      mockMutation,
+      { text: 'hi' },
+      { optimisticUpdate: update },
+    )
+
+    release({ text: 'hi' })
+    await inflight
+    flush()
+    expect(pending()).toBe(false)
+  })
+
+  it('exposes pending state for createConvexAction', async () => {
+    const root = document.createElement('div')
+    const client = createMockClient<string[]>()
+    let act!: ReturnType<typeof createConvexAction>
+
+    let release!: (value: unknown) => void
+    client.action = vi.fn(
+      () => new Promise(resolve => { release = resolve }),
+    ) as any
+
+    render(
+      () => (
+        <ConvexProvider client={client}>
+          {(() => {
+            act = createConvexAction(mockAction)
+            return null
+          })()}
+        </ConvexProvider>
+      ),
+      root,
+    )
+
+    expect(act.pending()).toBe(false)
+    const inflight = act({ prompt: 'hi' } as never)
+    flush()
+    expect(act.pending()).toBe(true)
+
+    release({ prompt: 'hi' })
+    await inflight
+    flush()
+    expect(act.pending()).toBe(false)
+  })
+
+  it('createConnectionState seeds synchronously and updates on change', () => {
+    const root = document.createElement('div')
+    const client = createMockClient<string[]>()
+    let state!: ReturnType<typeof createConnectionState>
+
+    render(
+      () => (
+        <ConvexProvider client={client}>
+          {(() => {
+            state = createConnectionState()
+            return null
+          })()}
+        </ConvexProvider>
+      ),
+      root,
+    )
+
+    expect(state().isWebSocketConnected).toBe(true)
+    expect(state().hasInflightRequests).toBe(false)
+    expect(client.subscribeToConnectionState).toHaveBeenCalledTimes(1)
+
+    client.emitConnectionState({
+      ...client.connectionStateValue,
+      hasInflightRequests: true,
+      inflightMutations: 1,
+    })
+    flush()
+    expect(state().hasInflightRequests).toBe(true)
+    expect(state().inflightMutations).toBe(1)
   })
 })

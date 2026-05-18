@@ -1,6 +1,7 @@
 import {
   createContext,
   createMemo,
+  createSignal,
   onCleanup,
   useContext,
   type Accessor,
@@ -10,13 +11,17 @@ import { isServer } from '@solidjs/web'
 import {
   ConvexClient,
   ConvexHttpClient,
+  type ConnectionState,
   type ConvexClientOptions,
+  type OptimisticUpdate,
 } from 'convex/browser'
 import type {
   FunctionArgs,
   FunctionReference,
   FunctionReturnType,
 } from 'convex/server'
+
+export type { OptimisticUpdate, OptimisticLocalStore } from 'convex/browser'
 
 export type MaybeAccessor<T> = T | Accessor<T>
 export type QuerySsrSource = 'server' | 'hybrid' | 'initial' | 'client'
@@ -100,9 +105,9 @@ export async function prefetchQuery<Query extends FunctionReference<'query'>>(
 
 export function createQuery<Query extends FunctionReference<'query'>>(
   query: Query,
-  args: MaybeAccessor<FunctionArgs<Query>>,
-  options?: CreateQueryOptions<FunctionReturnType<Query>>,
-): Accessor<FunctionReturnType<Query>> {
+  args: MaybeAccessor<FunctionArgs<Query> | 'skip'>,
+  options?: CreateQueryOptions<FunctionReturnType<Query> | undefined>,
+): Accessor<FunctionReturnType<Query> | undefined> {
   const client = useContext(ConvexClientContext)
 
   if (!client && !isServer) {
@@ -114,13 +119,39 @@ export function createQuery<Query extends FunctionReference<'query'>>(
   const ssrSource = options?.ssrSource ?? (hasInitialValue ? 'initial' : undefined)
   let activeDispose: (() => void) | undefined
 
-  const value = createMemo<FunctionReturnType<Query>>(
+  const value = createMemo<FunctionReturnType<Query> | undefined>(
     () => {
       if (!client) throw missingProviderError('createQuery')
 
       activeDispose?.()
 
       const queryArgs = resolveValue(args)
+
+      // Skip path: yield `undefined` synchronously and finish the iterator.
+      // The async-memo runtime commits the value without suspending.
+      if (queryArgs === 'skip') {
+        activeDispose = undefined
+        let yielded = false
+        return ({
+          [Symbol.asyncIterator]() {
+            return {
+              next() {
+                if (yielded) {
+                  return syncThenable({
+                    value: undefined as FunctionReturnType<Query>,
+                    done: true,
+                  })
+                }
+                yielded = true
+                return syncThenable({
+                  value: undefined as FunctionReturnType<Query>,
+                  done: false,
+                })
+              },
+            }
+          },
+        }) as unknown as FunctionReturnType<Query> | undefined
+      }
       const queue: FunctionReturnType<Query>[] = []
       let nextResolve: ((result: IteratorResult<FunctionReturnType<Query>>) => void) | null = null
       let nextReject: ((reason?: unknown) => void) | null = null
@@ -219,9 +250,9 @@ export function createQuery<Query extends FunctionReference<'query'>>(
             },
           }
         },
-      }) as AsyncIterable<FunctionReturnType<Query>>
+      }) as unknown as FunctionReturnType<Query> | undefined
     },
-    initialValue as FunctionReturnType<Query>,
+    initialValue,
     {
       name: 'convex-query',
       ssrSource,
@@ -233,32 +264,101 @@ export function createQuery<Query extends FunctionReference<'query'>>(
   return value
 }
 
+export type ConvexMutation<Mutation extends FunctionReference<'mutation'>> = {
+  (args: FunctionArgs<Mutation>): Promise<FunctionReturnType<Mutation>>
+  /**
+   * Bind a Convex optimistic update to this mutation. Returns a new bound
+   * mutation; the original is unaffected. The handler runs against the
+   * client's local query cache and is rolled back automatically when the
+   * server transaction completes (success or failure).
+   */
+  withOptimisticUpdate(
+    update: OptimisticUpdate<FunctionArgs<Mutation>>,
+  ): ConvexMutation<Mutation>
+  /** `true` while one or more calls are in flight. */
+  pending: Accessor<boolean>
+}
+
 export function createMutation<Mutation extends FunctionReference<'mutation'>>(
   mutation: Mutation,
-): (args: FunctionArgs<Mutation>) => Promise<FunctionReturnType<Mutation>> {
+): ConvexMutation<Mutation> {
   const client = useContext(ConvexClientContext)
 
   if (!client) {
     if (!isServer) throw missingProviderError('createMutation')
-    return async () => {
+    const stub = (async () => {
       throw missingProviderExecutionError('createMutation')
-    }
+    }) as unknown as ConvexMutation<Mutation>
+    stub.withOptimisticUpdate = () => stub
+    stub.pending = () => false
+    return stub
   }
 
-  return args => client.mutation(mutation, args)
+  return buildMutation(client, mutation, undefined)
+}
+
+function buildMutation<Mutation extends FunctionReference<'mutation'>>(
+  client: ConvexClient,
+  mutation: Mutation,
+  optimisticUpdate: OptimisticUpdate<FunctionArgs<Mutation>> | undefined,
+): ConvexMutation<Mutation> {
+  const [inflight, setInflight] = createSignal(0)
+
+  const call = ((args: FunctionArgs<Mutation>) => {
+    setInflight(n => n + 1)
+    const promise = optimisticUpdate
+      ? client.mutation(mutation, args, { optimisticUpdate })
+      : client.mutation(mutation, args)
+    return promise.finally(() => setInflight(n => n - 1))
+  }) as ConvexMutation<Mutation>
+
+  call.withOptimisticUpdate = update => buildMutation(client, mutation, update)
+  call.pending = () => inflight() > 0
+
+  return call
+}
+
+export type ConvexAction<ActionRef extends FunctionReference<'action'>> = {
+  (args: FunctionArgs<ActionRef>): Promise<FunctionReturnType<ActionRef>>
+  /** `true` while one or more calls are in flight. */
+  pending: Accessor<boolean>
 }
 
 export function createConvexAction<ActionRef extends FunctionReference<'action'>>(
   actionReference: ActionRef,
-): (args: FunctionArgs<ActionRef>) => Promise<FunctionReturnType<ActionRef>> {
+): ConvexAction<ActionRef> {
   const client = useContext(ConvexClientContext)
 
   if (!client) {
     if (!isServer) throw missingProviderError('createConvexAction')
-    return async () => {
+    const stub = (async () => {
       throw missingProviderExecutionError('createConvexAction')
-    }
+    }) as unknown as ConvexAction<ActionRef>
+    stub.pending = () => false
+    return stub
   }
 
-  return args => client.action(actionReference, args)
+  const [inflight, setInflight] = createSignal(0)
+
+  const call = ((args: FunctionArgs<ActionRef>) => {
+    setInflight(n => n + 1)
+    return client.action(actionReference, args).finally(() => setInflight(n => n - 1))
+  }) as ConvexAction<ActionRef>
+
+  call.pending = () => inflight() > 0
+  return call
+}
+
+/**
+ * Subscribe to the realtime client's {@link ConnectionState}. The accessor
+ * is seeded synchronously and updated on every state change.
+ */
+export function createConnectionState(): Accessor<ConnectionState> {
+  const client = useContext(ConvexClientContext)
+  if (!client) throw missingProviderError('createConnectionState')
+
+  const [state, setState] = createSignal(client.connectionState())
+  const unsubscribe = client.subscribeToConnectionState(next => setState(() => next))
+  onCleanup(unsubscribe)
+  return state
 }
