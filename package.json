@@ -42,6 +42,7 @@
     "update-deps": "pnpm up -Li"
   },
   "peerDependencies": {
+    "@solidjs/web": "^2.0.0-beta.2",
     "solid-js": "^2.0.0-beta.2"
   },
   "devDependencies": {

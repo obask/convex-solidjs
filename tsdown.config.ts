@@ -8,6 +8,9 @@ export default defineConfig({
   clean: true,
   platform: 'neutral',
   target: 'esnext',
+  deps: {
+    neverBundle: ['solid-js', '@solidjs/web', '@solidjs/signals', 'convex'],
+  },
   plugins: [
     solidPlugin({
       hot: false,
